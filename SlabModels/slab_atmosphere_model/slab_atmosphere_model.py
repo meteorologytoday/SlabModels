@@ -1,0 +1,307 @@
+"""Slab atmosphere model component."""
+
+import math
+from typing import Any
+
+import jax.numpy as jnp
+import jcm.constants as jcm_constants
+import tree_math
+
+from jem import constants
+from jem.base.component import Carry, CouplingTime, Diagnostics
+from jem.components.slab.base import SlabModelBase, forcing_variable, role_attrs
+from jem.components.slab.grid import SlabGrid
+from jem.components.slab.slab_atmosphere_model.params import SlabAtmosphereParameters
+from jem.utils.idealized_distribution import positive_cosine_cubic_latitude_squared
+
+
+@tree_math.struct
+class AtmosphereState:
+    mean_air_temperature: jnp.ndarray
+    mean_zonal_wind_velocity: jnp.ndarray
+    mean_meridional_wind_velocity: jnp.ndarray
+
+    @classmethod
+    def zeros(
+        cls,
+        shape,
+        mean_air_temperature=None,
+        mean_zonal_wind_velocity=None,
+        mean_meridional_wind_velocity=None,
+    ):
+        return cls(
+            mean_air_temperature if mean_air_temperature is not None else jnp.zeros(shape),
+            mean_zonal_wind_velocity if mean_zonal_wind_velocity is not None else jnp.zeros(shape),
+            mean_meridional_wind_velocity if mean_meridional_wind_velocity is not None else jnp.zeros(shape),
+        )
+
+
+@tree_math.struct
+class AtmosphereForcing:
+    land_surface_temperature: jnp.ndarray
+    sea_surface_temperature: jnp.ndarray
+    total_heat_flux: jnp.ndarray
+    bulk_drag_coefficient: jnp.ndarray
+
+    @classmethod
+    def zeros(
+        cls,
+        shape,
+        land_surface_temperature=None,
+        sea_surface_temperature=None,
+        total_heat_flux=None,
+        bulk_drag_coefficient=None,
+    ):
+        return cls(
+            land_surface_temperature if land_surface_temperature is not None else jnp.zeros(shape),
+            sea_surface_temperature if sea_surface_temperature is not None else jnp.zeros(shape),
+            total_heat_flux if total_heat_flux is not None else jnp.zeros(shape),
+            bulk_drag_coefficient if bulk_drag_coefficient is not None else jnp.zeros(()),
+        )
+
+
+@tree_math.struct
+class AtmosphereDerived:
+    internal_total_heat_flux: jnp.ndarray
+
+    @classmethod
+    def zeros(cls, shape, internal_total_heat_flux=None):
+        return cls(
+            internal_total_heat_flux if internal_total_heat_flux is not None else jnp.zeros(shape),
+        )
+
+
+class SlabAtmosphereModel(SlabModelBase):
+    """Slab atmosphere model for simple air-sea-land heat exchange.
+
+    This model simulates mean air temperature evolution using a bulk
+    aerodynamic formulation for sensible heat flux from the surface. It exists
+    to exercise a coupled run without a full atmosphere, not to be a climate
+    model: there is no radiation, no moisture and no dynamics.
+
+    The physics is a single column-mean heat budget::
+
+        dT_air/dt = (H_ocean + H_land) / (M_air * cp_air)
+
+    where ``T_air`` is the mean air temperature, ``H_ocean`` and ``H_land``
+    are the sensible heat fluxes from the surface below, ``M_air`` is the
+    atmospheric column mass, and ``cp_air`` is the specific heat capacity of
+    dry air at constant pressure, taken from ``jcm.constants.cpd`` -- the same
+    value the real atmosphere uses.
+    """
+
+    def __init__(
+        self,
+        grid: SlabGrid,
+        params: SlabAtmosphereParameters | None = None,
+        *,
+        name: str = "atm",
+    ):
+        """Initialize the slab atmosphere model.
+
+        Parameters
+        ----------
+        grid : SlabGrid
+            The model's grid.
+        params : SlabAtmosphereParameters, optional
+            Tunable parameters; defaults to
+            :meth:`SlabAtmosphereParameters.default`. They are all initial
+            conditions, and they are what :meth:`initialize` builds the
+            initial state from unless it is handed parameters of its own;
+            ``initialize(params)`` is the differentiable entry point for them.
+        name : str
+            Component name in the coupler's workflow and carry.
+
+        Raises
+        ------
+        ValueError
+            If an initial-condition parameter is not finite, or if
+            ``initial_temperature_base`` is not a strictly positive
+            temperature in kelvin.
+
+        """
+        super().__init__(name=name, grid=grid)
+        self.params = (
+            SlabAtmosphereParameters.default() if params is None else params
+        )
+
+        # Every parameter of this model is an initial condition copied straight
+        # into the initial state, so nothing downstream ever rejects a bad one:
+        # a non-finite value simply makes the whole trajectory non-finite. The
+        # winds are the quiet case -- an infinite wind gives an infinite bulk
+        # conductance, and the heat budget then evaluates `inf + -inf`, so the
+        # air temperature is NaN from the first step with no error anywhere.
+        # Validated here, at construction, because inside `initialize(params)`
+        # these are traced values that cannot be inspected; a caller who hands
+        # `initialize` parameters of its own takes on that responsibility.
+        base_temperature = float(self.params.initial_temperature_base)
+        if not math.isfinite(base_temperature) or base_temperature <= 0.0:
+            raise ValueError(
+                "params.initial_temperature_base must be a finite positive "
+                f"temperature in kelvin; got {base_temperature!r}."
+            )
+        # The amplitude and the two winds are signed quantities -- a negative
+        # amplitude is simply a pole-warm profile, a negative wind blows the
+        # other way -- so finiteness is all that is required of them.
+        for field_name in (
+            "initial_temperature_amplitude",
+            "initial_zonal_wind",
+            "initial_meridional_wind",
+        ):
+            value = float(getattr(self.params, field_name))
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"params.{field_name} must be finite (it is copied straight "
+                    f"into the initial state); got {value!r}."
+                )
+
+    def initialize(self, params: SlabAtmosphereParameters | None = None) -> Carry:
+        """Build the initial atmosphere carry.
+
+        Parameters
+        ----------
+        params : SlabAtmosphereParameters, optional
+            Parameters to start from; defaults to the ones the model was
+            constructed with. Every field of
+            :class:`SlabAtmosphereParameters` is an initial condition, read
+            here and nowhere else, so this is the entry point that makes them
+            differentiable: they are used as given, never converted to Python
+            ``float``, and ``jax.grad`` of a trajectory with respect to one
+            reaches the state the run starts from. The same object goes into
+            ``carry["params"]``.
+
+        """
+        params = self._initial_params(params)
+        latitude = self.grid.latitude_radian
+
+        mean_air_temperature = (
+            params.initial_temperature_base
+            + params.initial_temperature_amplitude
+            * positive_cosine_cubic_latitude_squared(latitude)
+        )
+
+        return {
+            "params": params,
+            "state": AtmosphereState.zeros(
+                self.grid.shape,
+                mean_air_temperature=mean_air_temperature,
+                mean_zonal_wind_velocity=jnp.full(
+                    self.grid.shape, params.initial_zonal_wind
+                ),
+                mean_meridional_wind_velocity=jnp.full(
+                    self.grid.shape, params.initial_meridional_wind
+                ),
+            ),
+            "derived": AtmosphereDerived.zeros(self.grid.shape),
+            "forcing": AtmosphereForcing.zeros(
+                self.grid.shape,
+                bulk_drag_coefficient=jnp.asarray(constants.bulk_drag_coefficient),
+            ),
+        }
+
+    def step(self, carry: Carry, time: CouplingTime) -> tuple[Carry, Diagnostics]:
+        """Advance the air column by one coupling step (Euler forward)."""
+        params = carry["params"]
+        state = carry["state"]
+        forcing = carry["forcing"]
+
+        # Land and ocean cells exchange heat with different surfaces, so each
+        # bulk flux is computed everywhere and then kept only where its surface
+        # actually is. A cell with any land takes the land surface, the same
+        # cells the land model runs on (``binary_land_mask``).
+        land = self.grid.binary_land_mask == 1.0
+
+        wind_speed = (
+            state.mean_zonal_wind_velocity**2 + state.mean_meridional_wind_velocity**2
+        ) ** 0.5
+        bulk_conductance = (
+            constants.surface_air_density
+            * forcing.bulk_drag_coefficient
+            * wind_speed
+            * jcm_constants.cpd
+        )
+
+        # Positive upward: a surface warmer than the air heats the air, and the
+        # column's own heat budget takes the flux with the opposite sign below.
+        surface_temperature = jnp.where(
+            land, forcing.land_surface_temperature, forcing.sea_surface_temperature
+        )
+        total_heat_flux = bulk_conductance * (
+            surface_temperature - state.mean_air_temperature
+        )
+
+        heat_capacity = constants.atmosphere_column_mass * jcm_constants.cpd
+        mean_air_temperature = (
+            state.mean_air_temperature + time.dt / heat_capacity * total_heat_flux
+        )
+
+        new_state = state.replace(mean_air_temperature=mean_air_temperature)
+        new_derived = AtmosphereDerived.zeros(
+            self.grid.shape, internal_total_heat_flux=total_heat_flux
+        )
+
+        diagnostics = {
+            "state": new_state,
+            "derived": new_derived,
+            "forcing": forcing,
+        }
+        return {"params": params, **diagnostics}, diagnostics
+
+    def _create_xarray_data_vars(self, diagnostics: Diagnostics) -> dict[str, Any]:
+        """Create xarray data variables for atmosphere output."""
+        state = diagnostics["state"]
+        forcing = diagnostics["forcing"]
+        derived = diagnostics["derived"]
+        dims = ("time",) + self.grid.dims
+
+        return {
+            forcing_variable("total_heat_flux"): (
+                dims,
+                forcing.total_heat_flux,
+                {
+                    "long_name": "Total heat flux the air column was forced with",
+                    "units": "W m-2",
+                    "positive": "upward",
+                    **role_attrs("forcing"),
+                },
+            ),
+            "internal_total_heat_flux": (
+                dims,
+                derived.internal_total_heat_flux,
+                {
+                    "long_name": "Internally-computed total heat flux (ocean + land sensible)",
+                    "units": "W m-2",
+                    "positive": "upward",
+                    **role_attrs("derived"),
+                },
+            ),
+            "mean_air_temperature": (
+                dims,
+                state.mean_air_temperature,
+                {
+                    "long_name": "Mean air column temperature",
+                    "units": "K",
+                    **role_attrs("state"),
+                },
+            ),
+            "mean_zonal_wind_velocity": (
+                dims,
+                state.mean_zonal_wind_velocity,
+                {
+                    "long_name": "Mean velocity of the air column in zonal direction",
+                    "units": "m s-1",
+                    "positive": "east",
+                    **role_attrs("state"),
+                },
+            ),
+            "mean_meridional_wind_velocity": (
+                dims,
+                state.mean_meridional_wind_velocity,
+                {
+                    "long_name": "Mean velocity of the air column in meridional direction",
+                    "units": "m s-1",
+                    "positive": "north",
+                    **role_attrs("state"),
+                },
+            ),
+        }

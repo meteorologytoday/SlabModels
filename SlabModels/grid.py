@@ -1,0 +1,380 @@
+"""Minimal grid concept owned by the slab models.
+
+Slab models do no advection, so the grid only needs the land fraction and the
+cell coordinates. The shape and the land and ocean masks are derived from
+``land_fraction``.
+
+Two constructors cover every grid JEM runs on:
+
+- :meth:`SlabGrid.from_coords` -- a separable lon/lat grid taken straight from
+  the dinosaur horizontal grid the atmosphere is discretized on
+  (``jcm.utils.get_coords(...).horizontal`` or
+  ``jcm.physics.speedy.speedy_coords.get_speedy_coords(...).horizontal``).
+  Taking the grid from the atmosphere guarantees the two agree.
+- :meth:`SlabGrid.from_scrip` -- a 2-D structured grid from a SCRIP file, which
+  may be curvilinear (a displaced-pole ocean grid).
+
+The land-sea mask comes from the atmosphere too:
+``jcm.terrain.TerrainData.from_coords(coords).fmask`` (or ``.from_file(...)`` /
+``.aquaplanet(coords)``) is already shaped ``(n_lon, n_lat)`` with latitude
+ascending south to north -- exactly ``SlabGrid``'s layout -- so it is passed
+through as ``land_fraction`` with no transpose or flip.
+"""
+
+from dataclasses import dataclass, field
+
+import jax.numpy as jnp
+import numpy as np
+import xarray as xr
+from jax import Array
+
+#: Largest departure from separability, in radians, still treated as a
+#: separable lon/lat grid. 1e-6 rad is ~6 m at the Earth's surface: far below
+#: any grid spacing, and above the float32 noise of a grid whose 2-D
+#: coordinate fields were written out cell by cell from 1-D axes.
+SEPARABILITY_TOLERANCE_RADIAN = 1e-6
+
+
+def to_degrees(radians) -> np.ndarray:
+    """Convert radians to degrees the way JCM does, in float64.
+
+    ``x * 180 / pi`` and ``numpy.rad2deg(x)`` (a single multiply by the
+    precomputed ``180/pi``) do not round identically. JCM writes its ``lon``
+    and ``lat`` coordinates with the two-operation form
+    (``jcm.utils.data_to_xarray``), so a slab dataset must too: a last-bit
+    difference in a coordinate value is enough for ``xr.merge`` to treat the
+    two grids as different axes and produce a 119-point longitude union out of
+    two 96-point grids.
+    """
+    return np.asarray(radians, dtype=np.float64) * 180.0 / np.pi
+
+
+def _separable_axes(
+    longitude_radian: Array,
+    latitude_radian: Array,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return the 1-D ``(longitude, latitude)`` axes, or None if curvilinear.
+
+    A grid is separable when longitude varies only along axis 0 and latitude
+    only along axis 1. That is what lets the model write CF 1-D ``lon``/``lat``
+    coordinates instead of 2-D auxiliary ones, and what lets a climatology file
+    written on 1-D axes be checked against the grid at all.
+    """
+    longitude = np.asarray(longitude_radian, dtype=np.float64)
+    latitude = np.asarray(latitude_radian, dtype=np.float64)
+
+    longitude_axis = longitude[:, 0]
+    latitude_axis = latitude[0, :]
+    separable = np.allclose(
+        longitude, longitude_axis[:, None], atol=SEPARABILITY_TOLERANCE_RADIAN, rtol=0.0
+    ) and np.allclose(
+        latitude, latitude_axis[None, :], atol=SEPARABILITY_TOLERANCE_RADIAN, rtol=0.0
+    )
+    return (longitude_axis, latitude_axis) if separable else None
+
+
+@dataclass
+class SlabGrid:
+    """Grid information needed by slab models.
+
+    The grid is defined by ``land_fraction``, ``latitude_radian`` and
+    ``longitude_radian``. The shape, the masks, whether the grid is separable
+    and the output dimension names are all derived from them.
+
+    The two masks overlap on coast cells. ``binary_land_mask`` is 1 wherever
+    there is any land (``land_fraction > 0``) and ``binary_ocean_mask`` is 1
+    wherever there is any ocean (``land_fraction < 1``), so a cell with a
+    land fraction between 0 and 1 is integrated by both the land and the
+    ocean components.
+
+    Attributes
+    ----------
+    land_fraction : jax.Array
+        Fraction of each grid cell occupied by land, in [0, 1], shaped
+        ``(n_lon, n_lat)``.
+    latitude_radian : jax.Array
+        2-D latitudes in radians, matching ``land_fraction.shape``.
+    longitude_radian : jax.Array
+        2-D longitudes in radians, matching ``land_fraction.shape``.
+    longitude_axis_radian, latitude_axis_radian : numpy.ndarray or None
+        The 1-D axes of a separable grid, in radians, in float64. Derived in
+        ``__post_init__`` when not given, and ``None`` for a curvilinear grid.
+        They are float64 numpy arrays because the output coordinates must
+        match JCM's bit for bit for ``xr.merge`` to align the datasets.
+
+    """
+
+    land_fraction: Array
+    latitude_radian: Array
+    longitude_radian: Array
+    longitude_axis_radian: np.ndarray | None = field(default=None)
+    latitude_axis_radian: np.ndarray | None = field(default=None)
+
+    def __post_init__(self):
+        """Check the shapes agree and work out whether the grid is separable."""
+        if self.latitude_radian.shape != self.land_fraction.shape:
+            raise ValueError(
+                f"latitude_radian has shape {tuple(self.latitude_radian.shape)} but "
+                f"land_fraction has shape {tuple(self.land_fraction.shape)}."
+            )
+        if self.longitude_radian.shape != self.land_fraction.shape:
+            raise ValueError(
+                f"longitude_radian has shape {tuple(self.longitude_radian.shape)} but "
+                f"land_fraction has shape {tuple(self.land_fraction.shape)}."
+            )
+        if len(self.land_fraction.shape) != 2:
+            raise ValueError(
+                "A SlabGrid is 2-D (n_lon, n_lat); got land_fraction with shape "
+                f"{tuple(self.land_fraction.shape)}."
+            )
+
+        # Every constructor ends here, so check the values here. A fill value
+        # (-1), a percentage or a NaN would otherwise give wrong but
+        # plausible-looking land and ocean masks.
+        mask = np.asarray(self.land_fraction)
+        if not np.all(np.isfinite(mask)):
+            raise ValueError("land_fraction contains non-finite values.")
+        if mask.size and (mask.min() < 0.0 or mask.max() > 1.0):
+            raise ValueError(
+                "land_fraction must lie in [0, 1] (1 = land); got values in "
+                f"[{mask.min():g}, {mask.max():g}]."
+            )
+
+        if self.longitude_axis_radian is None or self.latitude_axis_radian is None:
+            axes = _separable_axes(self.longitude_radian, self.latitude_radian)
+            if axes is not None:
+                self.longitude_axis_radian, self.latitude_axis_radian = axes
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Grid shape, ``(n_lon, n_lat)``."""
+        return tuple(self.land_fraction.shape)
+
+    @property
+    def is_separable(self) -> bool:
+        """True when the grid has genuine 1-D longitude and latitude axes."""
+        return (
+            self.longitude_axis_radian is not None
+            and self.latitude_axis_radian is not None
+        )
+
+    @property
+    def dims(self) -> tuple[str, str]:
+        """Dimension names of a 2-D field on this grid, in shape order.
+
+        A separable grid uses JCM's names, ``("lon", "lat")``, so slab and
+        JCM datasets merge. A curvilinear grid uses ``("x", "y")``, because
+        its 2-D ``lat``/``lon`` coordinates cannot share a name with a
+        dimension under CF and xarray.
+        """
+        return ("lon", "lat") if self.is_separable else ("x", "y")
+
+    @property
+    def binary_land_mask(self) -> Array:
+        """1 where the cell has any land (``land_fraction > 0``), else 0."""
+        return jnp.where(self.land_fraction > 0, 1.0, 0.0)
+
+    @property
+    def binary_ocean_mask(self) -> Array:
+        """1 where the cell has any ocean (``land_fraction < 1``), else 0."""
+        return jnp.where(self.land_fraction < 1, 1.0, 0.0)
+
+    @classmethod
+    def from_coords(
+        cls,
+        horizontal,
+        land_fraction: Array | None = None,
+    ) -> "SlabGrid":
+        """Build a SlabGrid on an atmosphere's horizontal grid.
+
+        Parameters
+        ----------
+        horizontal : dinosaur.spherical_harmonic.Grid
+            The horizontal grid of the coordinate system the atmosphere runs
+            on -- ``coords.horizontal`` for ``coords`` from
+            ``jcm.utils.get_coords`` or
+            ``jcm.physics.speedy.speedy_coords.get_speedy_coords``. Its
+            ``nodal_axes`` give longitude in radians and the sine of latitude,
+            in the same ``(n_lon, n_lat)`` layout SlabGrid uses.
+        land_fraction : jax.Array, optional
+            Land fraction in [0, 1], shaped ``(n_lon, n_lat)``. Take it from
+            ``jcm.terrain.TerrainData`` -- ``TerrainData.from_coords(coords).fmask``,
+            ``TerrainData.from_file(path, coords).fmask`` or
+            ``TerrainData.aquaplanet(coords).fmask`` -- which is already on
+            this layout and orientation. Defaults to all-ocean.
+
+        Returns
+        -------
+        SlabGrid
+
+        Raises
+        ------
+        ValueError
+            If ``land_fraction`` is not on the grid's shape or leaves [0, 1].
+
+        """
+        # arcsin of the nodal sine-latitude axis, rather than the grid's own
+        # ``latitudes`` attribute, because this is character for character what
+        # ``jcm.utils.data_to_xarray`` writes into its ``lat`` coordinate; any
+        # other route risks a last-bit difference that stops xr.merge aligning.
+        longitude_axis, sin_latitude = horizontal.nodal_axes
+        longitude_axis = np.asarray(longitude_axis, dtype=np.float64)
+        latitude_axis = np.arcsin(np.asarray(sin_latitude, dtype=np.float64))
+        shape = (longitude_axis.size, latitude_axis.size)
+
+        if land_fraction is None:
+            land_fraction = jnp.zeros(shape)
+        else:
+            land_fraction = jnp.asarray(land_fraction)
+            if tuple(land_fraction.shape) != shape:
+                raise ValueError(
+                    f"land_fraction has shape {tuple(land_fraction.shape)}, but this "
+                    f"grid is {shape} (n_lon, n_lat). TerrainData.fmask is already on "
+                    "this layout; a transposed mask is a sign it came from elsewhere."
+                )
+
+        longitude_2d = jnp.asarray(np.broadcast_to(longitude_axis[:, None], shape))
+        latitude_2d = jnp.asarray(np.broadcast_to(latitude_axis[None, :], shape))
+
+        return cls(
+            land_fraction=land_fraction,
+            latitude_radian=latitude_2d,
+            longitude_radian=longitude_2d,
+            longitude_axis_radian=longitude_axis,
+            latitude_axis_radian=latitude_axis,
+        )
+
+    @classmethod
+    def from_scrip(
+        cls,
+        scrip_file: str,
+        land_fraction: Array | None = None,
+    ) -> "SlabGrid":
+        """Build a SlabGrid from a SCRIP-convention grid file.
+
+        The file describes a 2-D structured (possibly curvilinear) grid -- e.g.
+        a displaced-pole ocean grid. This is not a general unstructured-mesh
+        reader: only SCRIP files with ``grid_rank == 2`` are supported.
+        ``grid_dims = [n_lon, n_lat]`` already matches SlabGrid's convention;
+        per-cell fields are stored flat in Fortran order (longitude varies
+        fastest) within that shape. Only ``grid_center_lat``/``grid_center_lon``
+        and ``grid_imask`` are read; ``grid_corner_*`` and ``grid_area`` exist
+        for computing regridding weights, which the slab models do not do.
+
+        Parameters
+        ----------
+        scrip_file : str
+            Path to a SCRIP-convention netCDF grid file.
+        land_fraction : jax.Array, optional
+            Land fraction in [0, 1] matching the file's shape. If None, it is
+            derived from the file's own ``grid_imask`` (see
+            :func:`_load_scrip_land_fraction` for the assumed polarity).
+
+        Returns
+        -------
+        SlabGrid
+
+        Raises
+        ------
+        ValueError
+            If the file is not a 2-D SCRIP grid, its variables disagree about
+            its size, its coordinate units are not recognised, or its centre
+            coordinates are not finite values inside the globe.
+
+        """
+        ds = xr.open_dataset(scrip_file)
+
+        if "grid_dims" not in ds:
+            raise ValueError(
+                f"'{scrip_file}' has no grid_dims variable -- not a SCRIP grid file."
+            )
+        grid_dims = ds["grid_dims"].values
+        if len(grid_dims) != 2:
+            raise ValueError(
+                "This reader only supports 2D SCRIP grids (grid_rank == 2); "
+                f"got grid_dims={grid_dims!r}."
+            )
+        ni, nj = (int(n) for n in grid_dims)
+
+        for name in ("grid_center_lat", "grid_center_lon"):
+            if name not in ds:
+                raise ValueError(f"'{scrip_file}' is missing required variable '{name}'.")
+
+        grid_size = ds["grid_center_lat"].shape[0]
+        if ni * nj != grid_size:
+            raise ValueError(
+                f"grid_dims {(ni, nj)} implies {ni * nj} cells, but "
+                f"'{scrip_file}' has grid_size={grid_size}."
+            )
+
+        longitude_2d = _scrip_latlon_to_radians(ds["grid_center_lon"], ni, nj, scrip_file)
+        latitude_2d = _scrip_latlon_to_radians(ds["grid_center_lat"], ni, nj, scrip_file)
+
+        # Non-finite first, for the same reason as `land_fraction` above: a
+        # NaN compares False against both bounds, so it would pass the range
+        # checks below and end up in the output's coordinate axes, where it
+        # breaks the merge of two components' datasets rather than this load.
+        for axis_name, values in (
+            ("latitude", latitude_2d), ("longitude", longitude_2d)
+        ):
+            if not bool(jnp.all(jnp.isfinite(values))):
+                raise ValueError(
+                    f"'{scrip_file}' has non-finite {axis_name} values."
+                )
+        if jnp.any((latitude_2d < -jnp.pi / 2) | (latitude_2d > jnp.pi / 2)):
+            raise ValueError(f"'{scrip_file}' has latitude values outside [-90, 90] degrees.")
+        if jnp.any((longitude_2d < -2 * jnp.pi) | (longitude_2d > 2 * jnp.pi)):
+            raise ValueError(f"'{scrip_file}' has longitude values outside [-360, 360] degrees.")
+
+        if land_fraction is None:
+            land_fraction = _load_scrip_land_fraction(ds, ni, nj)
+
+        return cls(
+            land_fraction=land_fraction,
+            latitude_radian=latitude_2d,
+            longitude_radian=longitude_2d,
+        )
+
+
+def _reshape_scrip_field(values, ni: int, nj: int) -> Array:
+    """Reshape a flat (grid_size,) SCRIP field into JEM's (n_lon, n_lat).
+
+    SCRIP stores per-cell fields flat, in Fortran order (the first
+    grid_dims axis -- longitude -- varies fastest). grid_dims = [ni, nj]
+    already gives JEM's (n_lon, n_lat) shape directly, so an order='F'
+    reshape recovers it with no transpose needed.
+    """
+    return jnp.asarray(values).reshape((ni, nj), order="F")
+
+
+def _scrip_latlon_to_radians(da: xr.DataArray, ni: int, nj: int, scrip_file: str) -> Array:
+    """Reshape and unit-convert a SCRIP grid_center_lat/lon field to radians."""
+    values_2d = _reshape_scrip_field(da.values, ni, nj)
+    units = da.attrs.get("units")
+    if units == "degrees":
+        return jnp.deg2rad(values_2d)
+    elif units == "radians":
+        return values_2d
+    else:
+        raise ValueError(
+            f"'{scrip_file}' variable '{da.name}' has unrecognized units "
+            f"{units!r}; expected 'degrees' or 'radians'."
+        )
+
+
+def _load_scrip_land_fraction(ds: xr.Dataset, ni: int, nj: int) -> Array:
+    """Derive a land_fraction (1 = land) from a SCRIP grid_imask.
+
+    SCRIP's grid_imask carries no CF-style flag_meanings metadata, so the
+    land/ocean polarity can't be verified from the file itself. This follows
+    the standard SCRIP/ESMF convention used by ocean-model grid files (e.g.
+    POP, CESM): imask=1 marks a valid/active (ocean) cell, imask=0 marks a
+    masked-out (land) cell. Pass `land_fraction` explicitly to
+    `SlabGrid.from_scrip` if a file uses the opposite convention.
+    """
+    if "grid_imask" not in ds:
+        # A SCRIP file without a mask describes the geometry only; an all-ocean
+        # mask is the neutral choice and is what the caller can override.
+        return jnp.zeros((ni, nj))
+    imask_2d = _reshape_scrip_field(ds["grid_imask"].values, ni, nj)
+    return jnp.where(imask_2d == 0, 1.0, 0.0)
